@@ -18,6 +18,18 @@ from mdir.preview_worker import configure_sheet
 
 
 class PreviewReliabilityTests(unittest.TestCase):
+    def test_shift_tab_survives_unsupported_iso_keysym(self):
+        import tkinter as tk
+        from mdir.workspace_app import _bind_shift_tab
+        widget = Mock()
+        def bind(sequence, callback):
+            if sequence == '<ISO_Left_Tab>':
+                raise tk.TclError('bad event type or keysym "ISO_Left_Tab"')
+        widget.bind.side_effect = bind
+        callback = Mock()
+        _bind_shift_tab(widget, callback)
+        self.assertEqual(widget.bind.call_args_list[0].args, ('<Shift-Tab>', callback))
+
     @unittest.skipUnless(os.name == 'nt', 'Windows process handle API')
     def test_only_new_private_excel_handle_can_be_terminated(self):
         from datetime import datetime, timezone

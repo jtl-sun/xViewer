@@ -78,6 +78,15 @@ MAX_QUICK_LINKS = MAX_LINKS
 MAX_RECENT_DIRS = 30
 
 
+def _bind_shift_tab(widget, callback):
+    widget.bind('<Shift-Tab>', callback)
+    try:
+        # Some Windows Tk builds do not define this X11 keysym.
+        widget.bind('<ISO_Left_Tab>', callback)
+    except tk.TclError:
+        pass
+
+
 # Backward-compatible helper names retained for the 2.3.x test/API surface.
 def _normalize_quick_links(values: object) -> list[dict[str, object]]:
     from .links import parse_links
@@ -580,8 +589,7 @@ class EditableVirtualSheet(VirtualSheet):
         # Tab is reserved for normal Excel-style cell movement.  Main-pane
         # switching uses Ctrl+Left / Ctrl+Right. Alt+1 / Alt+2 remain direct shortcuts; F6 is kept for compatibility.
         self.body.bind("<Tab>", lambda _e: self._tab_cell(False))
-        self.body.bind("<Shift-Tab>", lambda _e: self._tab_cell(True))
-        self.body.bind("<ISO_Left_Tab>", lambda _e: self._tab_cell(True))
+        _bind_shift_tab(self.body, lambda _e: self._tab_cell(True))
 
     def _report_cell(self) -> None:
         super()._report_cell()
@@ -653,8 +661,7 @@ class EditableVirtualSheet(VirtualSheet):
         entry.bind("<Return>", lambda _e: self.commit_edit())
         entry.bind("<Escape>", lambda _e: self.cancel_edit())
         entry.bind("<Tab>", lambda _e: self._commit_and_tab(False))
-        entry.bind("<Shift-Tab>", lambda _e: self._commit_and_tab(True))
-        entry.bind("<ISO_Left_Tab>", lambda _e: self._commit_and_tab(True))
+        _bind_shift_tab(entry, lambda _e: self._commit_and_tab(True))
         entry.bind("<FocusOut>", lambda _e: self.commit_edit())
         installer = getattr(self.winfo_toplevel(), "_apply_pane_nav_bindtag", None)
         if callable(installer):
@@ -1238,8 +1245,7 @@ class ExcelWorkspaceApp(tk.Tk):
         # controls. Pane switching already has dedicated shortcuts, and Tab is
         # reserved for Excel-style cell movement in the RIGHT workbook.
         self.file_tree.bind("<Tab>", self._block_left_file_tab)
-        self.file_tree.bind("<Shift-Tab>", self._block_left_file_tab)
-        self.file_tree.bind("<ISO_Left_Tab>", self._block_left_file_tab)
+        _bind_shift_tab(self.file_tree, self._block_left_file_tab)
         self.file_tree.bind("<Delete>", self._delete_selected_items)
         self.file_tree.bind("<KP_Delete>", self._delete_selected_items)
         self.file_tree.bind("<BackSpace>", lambda _e: self.go_up())

@@ -9,7 +9,28 @@ permissions:
   contents: write
 
 jobs:
+  validate:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      - name: Compile
+        run: python -m compileall -q mdir tests tools
+      - name: Test
+        run: python -m unittest discover -s tests -v
+      - name: Self-check
+        run: python -m mdir --check
   release:
+    needs: validate
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -23,18 +44,13 @@ jobs:
           python-version: '3.12'
           cache: pip
 
-      - name: Install and test
+      - name: Install build dependencies
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pip install -e ".[dev]"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m compileall -q mdir tests tools
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m unittest discover -s tests -v
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m mdir --check
 
       - name: Build release assets
         shell: pwsh

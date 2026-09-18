@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.7.4.post1 — Windows Python 3.11 startup compatibility
+
+- Keep Shift+Tab bindings when Windows Tk does not recognize ISO_Left_Tab.
+- Gate release publishing on Windows tests for Python 3.11, 3.12 and 3.13.
+- Preserve the published 2.7.4 tag and publish the compatibility correction separately.
+
 ## 2.7.4 — Bounded Excel preview and integrated text viewer
 
 - Isolate COM in a supervised subprocess with cancellation and a 15-second deadline.

@@ -1,4 +1,6 @@
-# xViewer 2.7.4
+# xViewer 2.7.4.post1
+
+2.7.4 배포 후 Windows/Python 3.11 검사에서 발견한 시작 오류를 수정한 호환성 수정판입니다. 일부 Tk에서 지원하지 않는 `ISO_Left_Tab`을 선택적으로 등록하며, 기본 Shift+Tab 동작은 유지합니다. Python 3.11/3.12/3.13 검사를 모두 통과한 뒤 릴리스를 게시합니다.
 
 xViewer는 Windows용 **Excel / PDF / Image / Text 통합 Viewer**입니다. LEFT 파일 리스트에서 많은 파일을 빠르게 훑어보고, RIGHT 패널에서 내용을 확인한 뒤 필요한 원본은 연결 프로그램이나 Microsoft Excel로 즉시 열 수 있습니다.
 
