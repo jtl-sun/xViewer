@@ -1,4 +1,6 @@
 from pathlib import Path
+import struct
+import zipfile
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
@@ -33,6 +35,12 @@ from mdir.excel_viewer import (
     _sheet_content_extent,
 )
 from mdir.media_viewer import IMAGE_EXTENSIONS, PDF_EXTENSIONS, _load_source_image, _render_pdf_page, fit_zoom_for_size, media_kind_for_path
+from mdir.excel_pdf_preview import (
+    excel_pdf_cache_path,
+    excel_pdf_cache_hit,
+    render_excel_pdf_cached,
+    ExcelPdfResult,
+)
 from mdir.workspace_app import APP_VERSION as WORKSPACE_APP_VERSION
 from mdir.links import (
     LinkDefinition,
@@ -136,7 +144,7 @@ class WorkspaceCoreTests(unittest.TestCase):
             self.assertEqual(_selection_workbook_action([pdf]), "load_pdf")
             self.assertEqual(_selection_workbook_action([image]), "load_image")
             self.assertEqual(_selection_workbook_action([folder]), "clear")
-            self.assertEqual(_selection_workbook_action([text]), "clear")
+            self.assertEqual(_selection_workbook_action([text]), "load_text")
             self.assertEqual(_selection_workbook_action([]), "keep")
             self.assertEqual(_selection_workbook_action([excel, text]), "keep")
 
@@ -181,6 +189,52 @@ class WorkspaceCoreTests(unittest.TestCase):
             self.assertEqual(count, 1)
             self.assertGreater(rendered.width, 200)
             self.assertGreater(rendered.height, 140)
+
+    def test_excel_pdf_cache_uses_source_metadata_and_reuses_existing_preview(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "sample.xlsx"
+            source.write_bytes(b"first")
+            with patch("mdir.excel_pdf_preview._cache_dir", return_value=root / "cache"):
+                first = excel_pdf_cache_path(source)
+                first.parent.mkdir(parents=True, exist_ok=True)
+                Image.new('RGB', (100, 80), 'white').save(first, 'PDF')
+                self.assertEqual(excel_pdf_cache_hit(source), first)
+                result = render_excel_pdf_cached(source)
+                self.assertTrue(result.ok)
+                self.assertTrue(result.from_cache)
+                self.assertEqual(result.backend, "cache")
+
+                # Changing source size/mtime produces a new cache identity.
+                source.write_bytes(b"second-version-with-different-size")
+                second = excel_pdf_cache_path(source)
+                self.assertNotEqual(first, second)
+                self.assertIsNone(excel_pdf_cache_hit(source))
+
+    def test_excel_open_path_prefers_cached_pdf_engine_not_native_grid(self):
+        import inspect
+        from mdir.workspace_app import ExcelWorkspaceApp
+        source = inspect.getsource(ExcelWorkspaceApp.open_workbook)
+        self.assertIn("excel_pdf_cache_hit", source)
+        self.assertIn("self._excel_pdf_engine.request", source)
+        self.assertIn('self.viewer_kind = "excel_pdf"', source)
+        self.assertNotIn("EditableWorkbookModel(path)", source)
+
+    def test_excel_pdf_preview_does_not_prefetch_adjacent_files(self):
+        from mdir.excel_pdf_preview import ExcelPdfPreviewEngine
+        engine = ExcelPdfPreviewEngine()
+        try:
+            with patch.object(engine, 'request') as request:
+                engine.prefetch([Path('neighbor.xlsx')])
+                request.assert_not_called()
+        finally:
+            engine.close()
+            engine._thread.join(2)
+
+    def test_windows_pywin32_dependency_is_declared_for_persistent_excel_engine(self):
+        project = Path(__file__).resolve().parents[1]
+        pyproject = (project / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn("pywin32>=306; platform_system == 'Windows'", pyproject)
 
     def test_parse_clipboard_value(self):
         self.assertEqual(_parse_clipboard_value("12"), 12)
@@ -300,6 +354,99 @@ class WorkspaceCoreTests(unittest.TestCase):
             self.assertEqual(check.active["A1"].value, "Changed")
             self.assertEqual(check.active["B2"].value, 123)
             check.close()
+
+    def test_malformed_emf_image_does_not_abort_modern_workbook_load(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            good1 = root / "good1.png"
+            good2 = root / "good2.png"
+            Image.new("RGB", (32, 24), (20, 100, 180)).save(good1)
+            Image.new("RGB", (28, 20), (180, 100, 20)).save(good2)
+
+            source = root / "source.xlsx"
+            broken = root / "broken-image.xlsx"
+            wb = Workbook()
+            ws = wb.active
+            ws["A1"] = "still opens"
+            ws.add_image(XLImage(str(good1)), "B2")
+            ws.add_image(XLImage(str(good2)), "F2")
+            wb.save(source)
+
+            # Build a minimal EMF header with a valid bbox but zero frame
+            # dimensions. Pillow's WMF/EMF parser divides by the frame width
+            # and used to raise ZeroDivisionError while openpyxl loaded the
+            # workbook drawing layer.
+            malformed = bytearray(44)
+            malformed[0:4] = b"\x01\x00\x00\x00"
+            struct.pack_into("<iiii", malformed, 8, 0, 0, 100, 100)
+            struct.pack_into("<iiii", malformed, 24, 0, 0, 0, 0)
+            malformed[40:44] = b" EMF"
+
+            with zipfile.ZipFile(source, "r") as zin:
+                media = sorted(name for name in zin.namelist() if name.startswith("xl/media/"))
+                self.assertEqual(len(media), 2)
+                bad_name = media[-1]
+                with zipfile.ZipFile(broken, "w", zipfile.ZIP_DEFLATED) as zout:
+                    for info in zin.infolist():
+                        payload = bytes(malformed) if info.filename == bad_name else zin.read(info.filename)
+                        zout.writestr(info, payload)
+
+            model = EditableWorkbookModel(broken)
+            try:
+                self.assertEqual(model.sheets[0].value(1, 1), "still opens")
+                self.assertFalse(model.editable)
+                self.assertGreaterEqual(len(model.skipped_image_errors), 1)
+                self.assertEqual(len(model.sheets[0].images), 1)
+                self.assertIn("Safe View", model.kind)
+            finally:
+                model.close()
+
+    def test_missing_null_drawing_part_does_not_abort_workbook_load(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            image1 = root / "sheet1.png"
+            image2 = root / "sheet2.png"
+            Image.new("RGB", (24, 18), (20, 120, 60)).save(image1)
+            Image.new("RGB", (26, 20), (160, 80, 30)).save(image2)
+
+            source = root / "source.xlsx"
+            broken = root / "missing-drawing-part.xlsx"
+            wb = Workbook()
+            ws1 = wb.active
+            ws1.title = "BrokenDrawing"
+            ws1["A1"] = "sheet one still opens"
+            ws1.add_image(XLImage(str(image1)), "B2")
+            ws2 = wb.create_sheet("GoodDrawing")
+            ws2["A1"] = "sheet two still opens"
+            ws2.add_image(XLImage(str(image2)), "C3")
+            wb.save(source)
+
+            # Reproduce workbooks that contain a stale drawing relationship
+            # whose target is literally /xl/drawings/NULL. openpyxl normally
+            # raises KeyError: There is no item named 'xl/drawings/NULL'.
+            with zipfile.ZipFile(source, "r") as zin:
+                with zipfile.ZipFile(broken, "w", zipfile.ZIP_DEFLATED) as zout:
+                    for info in zin.infolist():
+                        payload = zin.read(info.filename)
+                        if info.filename == "xl/worksheets/_rels/sheet1.xml.rels":
+                            payload = payload.replace(
+                                b"/xl/drawings/drawing1.xml",
+                                b"/xl/drawings/NULL",
+                            )
+                        zout.writestr(info, payload)
+
+            model = EditableWorkbookModel(broken)
+            try:
+                self.assertEqual(model.sheets[0].value(1, 1), "sheet one still opens")
+                self.assertEqual(model.sheets[1].value(1, 1), "sheet two still opens")
+                self.assertFalse(model.editable)
+                self.assertGreaterEqual(len(model.skipped_image_errors), 1)
+                self.assertTrue(any("NULL" in item for item in model.skipped_image_errors))
+                self.assertEqual(len(model.sheets[0].images), 0)
+                self.assertEqual(len(model.sheets[1].images), 1)
+                self.assertIn("Safe View", model.kind)
+            finally:
+                model.close()
 
     def test_embedded_image_survives_edit_and_save(self):
         with TemporaryDirectory() as td:

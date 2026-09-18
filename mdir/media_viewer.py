@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import io
 import threading
+import math
+import time
 from pathlib import Path
 from typing import Callable, Mapping, Optional
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageChops
+from .ui_dispatch import install_dispatch
+from .background import LatestWorker
+from .excel_pdf_preview import _diagnostic
 
 from .excel_viewer import copy_pil_image_to_windows_clipboard
 
@@ -54,7 +59,33 @@ def fit_zoom_for_size(
     return max(0.01, float(zoom))
 
 
-def _render_pdf_page(path: Path, page_index: int, zoom: float) -> tuple[Image.Image, int]:
+_PDF_LOCK = threading.RLock()
+
+
+def trim_excel_whitespace(image):
+    """Crop only near-white outer margins, retaining a 12px safety border."""
+    rgb = image.convert('RGB')
+    difference = ImageChops.difference(rgb, Image.new('RGB', rgb.size, 'white'))
+    # Even faint gray marks count as content; never trim the actual PDF file.
+    bounds = difference.getbbox()
+    if not bounds:
+        return image
+    left, top, right, bottom = bounds
+    padding = 12
+    return image.crop((max(0, left-padding), max(0, top-padding),
+                       min(image.width, right+padding), min(image.height, bottom+padding)))
+
+
+def _render_pdf_page(path, page_index, zoom):
+    # PDFium is not thread safe, even across separate documents.
+    with _PDF_LOCK:
+        started = time.monotonic()
+        result = _render_pdf_page_locked(path, page_index, zoom)
+        _diagnostic('pdfium_render', source=path, page=page_index, elapsed=time.monotonic()-started)
+        return result
+
+
+def _render_pdf_page_locked(path: Path, page_index: int, zoom: float) -> tuple[Image.Image, int]:
     """Render one PDF page to a Pillow image and return (image, page_count).
 
     pypdfium2 is used instead of embedding Microsoft Office or requiring an
@@ -74,6 +105,8 @@ def _render_pdf_page(path: Path, page_index: int, zoom: float) -> tuple[Image.Im
             # PDF points are 72 dpi. 96 dpi at 100% is a comfortable Windows
             # baseline while the UI zoom multiplier remains intuitive.
             scale = max(0.25, min(4.0, float(zoom))) * (96.0 / 72.0)
+            width, height = page.get_size()
+            scale = min(scale, math.sqrt(16_000_000 / max(1, width * height)))
             bitmap = page.render(scale=scale)
             try:
                 image = bitmap.to_pil().convert("RGB")
@@ -124,10 +157,16 @@ class MediaViewer(ttk.Frame):
         zoom_callback: Optional[Callable[[float, str], None]] = None,
     ) -> None:
         super().__init__(parent)
+        self._post = install_dispatch(self)
+        self._worker = LatestWorker('xViewer-Media')
+        self.bind('<Destroy>', lambda event: self._worker.close() if event.widget is self else None, add='+')
+        self.trim_whitespace = False
+        self._source_scale = 1.0
         self.status_callback = status_callback
         self.page_callback = page_callback
         self.ui_palette = dict(ui_palette)
         self.zoom_callback = zoom_callback
+        self.failure_callback = None
         self.path: Optional[Path] = None
         self.kind: Optional[str] = None
         self.zoom = 1.0
@@ -178,6 +217,7 @@ class MediaViewer(ttk.Frame):
             pass
 
     def clear(self) -> None:
+        self._worker.cancel()
         self._generation += 1
         if self._resize_job:
             try:
@@ -199,6 +239,10 @@ class MediaViewer(ttk.Frame):
         self.page_callback(0, 0, "")
         self._show_message("Select a PDF or image file on the left.")
 
+    def show_message(self, text: str) -> None:
+        """Display a centered transient message without changing the current file."""
+        self._show_message(text)
+
     def _show_message(self, text: str) -> None:
         self.canvas.delete("all")
         try:
@@ -217,7 +261,7 @@ class MediaViewer(ttk.Frame):
         )
         self.canvas.configure(scrollregion=(0, 0, width, height))
 
-    def load(self, path: Path | str, kind: str, *, display_label: Optional[str] = None) -> None:
+    def load(self, path: Path | str, kind: str, *, display_label: Optional[str] = None, trim_whitespace: bool = False) -> None:
         path = Path(path)
         kind = str(kind).lower()
         if kind not in {"pdf", "image"}:
@@ -227,11 +271,12 @@ class MediaViewer(ttk.Frame):
         self.path = path
         self.kind = kind
         self.display_label = display_label
+        self.trim_whitespace = trim_whitespace
         self.page_index = 0
         self.page_count = 1 if kind == "image" else 0
-        if kind == "image":
-            self.image_fit_mode = True
-            self.zoom = 1.0
+        self.image_fit_mode = True
+        self.zoom = 1.0
+        self._source_scale = 1.0
         self._source_image = None
         self._display_image = None
         self._tk_image = None
@@ -244,13 +289,13 @@ class MediaViewer(ttk.Frame):
                     image = _load_source_image(path)
                     result = (image, 1)
                 else:
-                    result = _render_pdf_page(path, 0, self.zoom)
+                    result = _render_pdf_page(path, 0, 1.0)
             except Exception as exc:
-                self.after(0, lambda: self._load_failed(generation, path, exc))
+                self._post(lambda error=exc: self._load_failed(generation, path, error))
                 return
-            self.after(0, lambda: self._load_complete(generation, path, kind, result[0], result[1]))
+            self._post(lambda: self._load_complete(generation, path, kind, result[0], result[1]))
 
-        threading.Thread(target=worker, name="xViewer-Media-Loader", daemon=True).start()
+        self._worker.submit(worker)
 
     def _load_failed(self, generation: int, path: Path, exc: Exception) -> None:
         if generation != self._generation:
@@ -261,6 +306,8 @@ class MediaViewer(ttk.Frame):
         self._show_message(f"Could not open:\n{path.name}\n\n{exc}")
         self.status_callback(f"Open failed: {path.name} | {exc}")
         self.page_callback(0, 0, self.kind or "")
+        if self.failure_callback is not None:
+            self.failure_callback(path, exc)
 
     def _load_complete(
         self,
@@ -273,13 +320,9 @@ class MediaViewer(ttk.Frame):
         if generation != self._generation or self.path != path or self.kind != kind:
             return
         self.page_count = max(1, int(page_count))
-        if kind == "image":
-            self._source_image = image
-            self._render_image_source()
-        else:
-            self._source_image = None
-            self._display_image = image
-            self._paint(image)
+        self._source_image = trim_excel_whitespace(image) if self.trim_whitespace and kind == 'pdf' else image
+        self._source_scale = 1.0
+        self._render_image_source()
         self.page_callback(self.page_index, self.page_count, kind)
         shown = self.display_label or str(path)
         if kind == "pdf":
@@ -312,10 +355,11 @@ class MediaViewer(ttk.Frame):
         if source is None:
             return 1.0
         return fit_zoom_for_size(
-            source.width,
-            source.height,
+            source.width / self._source_scale,
+            source.height / self._source_scale,
             max(1, self.canvas.winfo_width()),
             max(1, self.canvas.winfo_height()),
+            allow_upscale=self.kind == "pdf",
         )
 
     def _render_image_source(self) -> None:
@@ -328,9 +372,12 @@ class MediaViewer(ttk.Frame):
         else:
             self.zoom = max(0.01, min(4.0, float(self.zoom)))
             mode = "manual" if abs(self.zoom - 1.0) > 1e-9 else "1:1"
-        zoom = self.zoom
+        zoom = self.zoom / self._source_scale
         width = max(1, int(round(source.width * zoom)))
         height = max(1, int(round(source.height * zoom)))
+        if width * height > 24_000_000:
+            reduction = math.sqrt(24_000_000 / (width * height))
+            width, height = max(1, int(width * reduction)), max(1, int(height * reduction))
         if width == source.width and height == source.height:
             display = source.copy()
         else:
@@ -355,18 +402,21 @@ class MediaViewer(ttk.Frame):
                     pass
             self._resize_job = self.after(70, self._render_image_after_zoom)
         else:
-            self._render_pdf_current_page()
+            self.image_fit_mode = False
+            if self._resize_job:
+                self.after_cancel(self._resize_job)
+            self._resize_job = self.after(100, self._render_pdf_current_page)
 
     def show_fit(self) -> None:
         """Fit an image to the viewport without enlarging it above 1:1."""
-        if self.kind != "image" or self._source_image is None:
+        if self.kind not in {"image", "pdf"} or self._source_image is None:
             return
         self.image_fit_mode = True
         self._schedule_image_render(20)
 
     def show_one_to_one(self) -> None:
         """Show an image at its original pixel size (100%)."""
-        if self.kind != "image" or self._source_image is None:
+        if self.kind not in {"image", "pdf"} or self._source_image is None:
             return
         self.image_fit_mode = False
         self.zoom = 1.0
@@ -374,7 +424,7 @@ class MediaViewer(ttk.Frame):
 
     def toggle_fit_one_to_one(self) -> str:
         """Toggle image display between Fit and original 1:1 size."""
-        if self.kind != "image":
+        if self.kind not in {"image", "pdf"}:
             return ""
         if self.image_fit_mode:
             self.show_one_to_one()
@@ -393,7 +443,7 @@ class MediaViewer(ttk.Frame):
     def _canvas_configured(self, _event=None) -> None:
         # In Fit mode the image follows the available RIGHT-pane size.  Debounce
         # resize storms while the user drags the pane splitter/window edge.
-        if self.kind == "image" and self.image_fit_mode and self._source_image is not None:
+        if self.kind in {"image", "pdf"} and self.image_fit_mode and self._source_image is not None:
             self._schedule_image_render(90)
 
     def _render_image_after_zoom(self) -> None:
@@ -407,18 +457,19 @@ class MediaViewer(ttk.Frame):
         generation = self._generation
         path = self.path
         page_index = self.page_index
-        zoom = self.zoom
+        zoom = 1.0 if self.image_fit_mode else self.zoom
+        self._resize_job = None
         self._show_message(f"Rendering {path.name}\nPage {page_index + 1} ...")
 
         def worker() -> None:
             try:
                 image, count = _render_pdf_page(path, page_index, zoom)
             except Exception as exc:
-                self.after(0, lambda: self._load_failed(generation, path, exc))
+                self._post(lambda error=exc: self._load_failed(generation, path, error))
                 return
-            self.after(0, lambda: self._pdf_page_complete(generation, path, page_index, image, count))
+            self._post(lambda: self._pdf_page_complete(generation, path, page_index, image, count, zoom))
 
-        threading.Thread(target=worker, name="xViewer-PDF-Renderer", daemon=True).start()
+        self._worker.submit(worker)
 
     def _pdf_page_complete(
         self,
@@ -427,11 +478,14 @@ class MediaViewer(ttk.Frame):
         page_index: int,
         image: Image.Image,
         page_count: int,
+        source_scale: float = 1.0,
     ) -> None:
         if generation != self._generation or self.path != path or self.kind != "pdf" or page_index != self.page_index:
             return
         self.page_count = max(1, int(page_count))
-        self._paint(image)
+        self._source_image = trim_excel_whitespace(image) if self.trim_whitespace else image
+        self._source_scale = source_scale
+        self._render_image_source()
         self.page_callback(self.page_index, self.page_count, "pdf")
         self.status_callback(f"{path} | PDF | {self.page_count} page(s) | Page {self.page_index + 1}")
 

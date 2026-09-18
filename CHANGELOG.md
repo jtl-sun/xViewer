@@ -1,5 +1,49 @@
 # Changelog
 
+## 2.7.4 — Bounded Excel preview and integrated text viewer
+
+- Isolate COM in a supervised subprocess with cancellation and a 15-second deadline.
+- Prioritize latest foreground selection; disable speculative prefetch.
+- Recognize OOXML workbooks incorrectly named .xls.
+- Fix PDF/image selection and background exception delivery to Tk.
+- Add PDF Fit, independent filters, read-only text, conservative Excel-only whitespace trim.
+- Bound PDF work, serialize PDFium, strengthen cache publication and diagnostics.
+- Keep native fallback read-only and prevent recursive legacy COM conversion retries.
+- Add subprocess, concurrency, failure recovery, format mismatch and hidden-Tk regression tests.
+
+
+## 2.7.0 — Fast Excel-rendered PDF preview engine
+
+- Change the default viewer for `.xls`, `.xlsx`, `.xlsm`, `.xltx`, and `.xltm` to an Excel-rendered PDF preview instead of the Python virtual workbook renderer.
+- Add a reusable hidden Microsoft Excel COM engine on a dedicated worker thread (`pywin32` on Windows), avoiding Excel process startup for every file.
+- Add persistent Excel PDF cache under `%LOCALAPPDATA%\xViewer\cache\excel-pdf`; cache identity changes automatically when source path/size/mtime changes.
+- Warm Excel automation in the background after xViewer starts.
+- Add low-priority neighbor prefetch: previous 1 + next 2 Excel files after a short idle delay.
+- Reduce LEFT selection debounce for cached Excel previews so arrow-key browsing feels nearly immediate.
+- Use Microsoft Excel PowerShell automation and LibreOffice as conversion fallbacks.
+- Keep the old native openpyxl/xlrd workbook renderer as a last-resort compatibility fallback only.
+- Excel previews are read-only in xViewer; Enter, double-click, or **Open in Excel** opens the original for editing.
+- Add regression coverage for preview-cache reuse/invalidation, PDF-first routing, prefetch, and Windows pywin32 dependency.
+
+## 2.6.9 — Missing DrawingML package-part recovery
+
+- Fix modern Excel workbooks that fail with `There is no item named 'xl/drawings/NULL' in the archive`.
+- Guard `openpyxl.reader.excel.find_images()` per drawing relationship, not only the per-image Pillow constructor.
+- Skip only the broken/missing drawing part so valid drawings on other worksheets still load.
+- Add `KeyError`/missing ZIP drawing part handling to the final drawing-free Safe View fallback.
+- Keep affected workbooks read-only in **SAFE VIEW** so xViewer cannot overwrite the original after unsupported drawing content was omitted.
+- Add a real malformed-package regression test using a worksheet relationship targeted at `/xl/drawings/NULL`.
+
+## 2.6.8 — Safe loading for malformed Excel embedded images
+
+- Fix `.xlsx/.xlsm/.xltx/.xltm` workbooks that could fail completely with `float division by zero` while Pillow/openpyxl parsed malformed EMF/WMF image metadata.
+- Guard openpyxl's per-image constructor so a broken embedded image is skipped instead of aborting the workbook load.
+- Add a last-resort drawing-free retry when malformed drawing metadata still escapes the per-image guard.
+- Open affected workbooks as **SAFE VIEW** (read-only) when any drawing item was skipped, preventing xViewer from saving a copy that could silently lose unsupported drawing content.
+- Show the skipped-item count in the workbook title/status while keeping valid sheets, cells, and readable images available.
+
+# Changelog
+
 ## 2.6.7 — Windows icon cache fix and xViewer release hardening
 
 - Fix the Desktop/Start Menu shortcut still showing the old xExcel-era icon after an update. The installer now copies the icon to a versioned path such as `%LOCALAPPDATA%\xViewer\icons\xviewer-2.6.7.ico` instead of overwriting the same cached filename.

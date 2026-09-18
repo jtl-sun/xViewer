@@ -107,7 +107,7 @@ foreach ($ShortcutPath in @((Join-Path $Desktop "xViewer.lnk"),(Join-Path $Start
     $Shortcut.Arguments = "-P -m mdir"
     $Shortcut.WorkingDirectory = [Environment]::GetFolderPath("UserProfile")
     if (Test-Path -LiteralPath $InstalledIcon) { $Shortcut.IconLocation = "$InstalledIcon,0" }
-    $Shortcut.Description = "xViewer - browse Excel workbooks, PDFs, and images in one viewer"
+    $Shortcut.Description = "xViewer - browse Excel workbooks, PDFs, images, and text in one viewer"
     $Shortcut.Save()
 }
 
@@ -115,12 +115,12 @@ Write-Host "[4/4] Registering Open with xViewer..." -ForegroundColor Green
 $ProgId = "xViewer.Workbook"
 $ProgRoot = "HKCU:\Software\Classes\$ProgId"
 New-Item -Path $ProgRoot -Force | Out-Null
-Set-Item -Path $ProgRoot -Value "Excel / PDF / Image - xViewer"
+Set-Item -Path $ProgRoot -Value "Excel / PDF / Image / Text - xViewer"
 New-Item -Path "$ProgRoot\DefaultIcon" -Force | Out-Null
 Set-Item -Path "$ProgRoot\DefaultIcon" -Value "`"$InstalledIcon`",0"
 New-Item -Path "$ProgRoot\shell\open\command" -Force | Out-Null
 Set-Item -Path "$ProgRoot\shell\open\command" -Value "`"$VenvPythonw`" -P -m mdir `"%1`""
-foreach ($Ext in @(".xlsx", ".xlsm", ".xltx", ".xltm", ".xls", ".pdf", ".png", ".jpg", ".jpeg", ".jfif", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".ico")) {
+foreach ($Ext in @(".xlsx", ".xlsm", ".xltx", ".xltm", ".xls", ".pdf", ".png", ".jpg", ".jpeg", ".jfif", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".ico", ".txt", ".md", ".markdown", ".csv", ".json")) {
     $OpenWith = "HKCU:\Software\Classes\$Ext\OpenWithProgids"
     New-Item -Path $OpenWith -Force | Out-Null
     New-ItemProperty -Path $OpenWith -Name $ProgId -Value "" -PropertyType String -Force | Out-Null
@@ -146,7 +146,7 @@ $LegacyStart = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\xEx
 Remove-Item -LiteralPath $LegacyDesktop -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $LegacyStart -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath "HKCU:\Software\Classes\xExcelViewer.Workbook" -Recurse -Force -ErrorAction SilentlyContinue
-foreach ($Ext in @(".xlsx", ".xlsm", ".xltx", ".xltm", ".xls", ".pdf", ".png", ".jpg", ".jpeg", ".jfif", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".ico")) {
+foreach ($Ext in @(".xlsx", ".xlsm", ".xltx", ".xltm", ".xls", ".pdf", ".png", ".jpg", ".jpeg", ".jfif", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".ico", ".txt", ".md", ".markdown", ".csv", ".json")) {
     Remove-ItemProperty -LiteralPath ("HKCU:\Software\Classes\" + $Ext + "\OpenWithProgids") -Name "xExcelViewer.Workbook" -ErrorAction SilentlyContinue
 }
 if ((Test-Path -LiteralPath $LegacyInstallRoot) -and ($LegacyInstallRoot -ne $InstallRoot)) {

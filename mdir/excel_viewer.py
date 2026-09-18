@@ -42,6 +42,86 @@ SELECTION_COLOR = "#217346"
 ACTIVE_CELL_FILL = "#e8f3ec"
 
 _LEGACY_XLS_CONVERSION_LOCK = threading.RLock()
+
+_OPENPYXL_SAFE_LOAD_LOCK = threading.RLock()
+
+
+def _safe_openpyxl_load_workbook(path: Path, **kwargs):
+    """Load a modern Excel workbook while isolating malformed embedded images.
+
+    Some legacy-created .xlsx files contain EMF/WMF records whose frame metadata
+    is invalid (for example a zero frame width/height). Pillow may then raise
+    ``ZeroDivisionError`` while openpyxl is merely scanning drawing images.
+    openpyxl normally catches ``OSError`` only, so one malformed picture can make
+    the entire workbook fail to open.
+
+    xViewer temporarily wraps openpyxl's per-image constructor so any image decode
+    failure is converted to ``OSError``. openpyxl will then skip only that picture
+    and continue loading the workbook. If a drawing-level failure still escapes,
+    xViewer retries once with drawing images/charts suppressed. The caller receives
+    a list of skipped-image diagnostics and should treat the workbook as read-only
+    to avoid saving a file after openpyxl has omitted unsupported drawing content.
+    """
+    from openpyxl import load_workbook
+    import openpyxl.reader.drawings as drawings_reader
+    import openpyxl.reader.excel as excel_reader
+
+    source = Path(path)
+    if source.suffix.lower() not in MODERN_EXCEL_EXTENSIONS:
+        # Some suppliers name an OOXML workbook .xls. A binary stream avoids
+        # openpyxl's extension check without renaming/modifying the source.
+        source = io.BytesIO(source.read_bytes())
+    skipped: list[str] = []
+
+    with _OPENPYXL_SAFE_LOAD_LOCK:
+        original_image = drawings_reader.Image
+        original_find_images = excel_reader.find_images
+
+        def guarded_image(image_source):
+            try:
+                return original_image(image_source)
+            except Exception as exc:
+                skipped.append(f"{type(exc).__name__}: {exc}")
+                # openpyxl.find_images already knows how to skip OSError.
+                raise OSError(f"xViewer skipped malformed embedded image: {exc}") from exc
+
+        def guarded_find_images(archive, drawing_path):
+            try:
+                return original_find_images(archive, drawing_path)
+            except (KeyError, OSError, ZeroDivisionError, ValueError, SyntaxError) as exc:
+                # Some producer applications leave a worksheet drawing
+                # relationship behind but point it at a non-existent part such
+                # as ``xl/drawings/NULL``.  openpyxl raises KeyError before it
+                # ever reaches the per-image constructor.  Skip only that
+                # broken drawing relationship so other sheets/drawings remain
+                # available.
+                skipped.append(
+                    f"Drawing skipped ({drawing_path!s}): {type(exc).__name__}: {exc}"
+                )
+                return [], []
+
+        drawings_reader.Image = guarded_image
+        excel_reader.find_images = guarded_find_images
+        try:
+            try:
+                workbook = load_workbook(source, **kwargs)
+            except (KeyError, OSError, ZeroDivisionError, ValueError, SyntaxError) as exc:
+                # Last-resort safe-view fallback: malformed DrawingML, missing
+                # drawing package parts, or image metadata can fail before the
+                # per-drawing/per-image guards are reached. Load cells/sheets
+                # without drawings so the workbook remains viewable.
+                skipped.append(f"Drawing fallback: {type(exc).__name__}: {exc}")
+
+                def no_drawings(_archive, _path):
+                    return [], []
+
+                excel_reader.find_images = no_drawings
+                workbook = load_workbook(source, **kwargs)
+        finally:
+            drawings_reader.Image = original_image
+            excel_reader.find_images = original_find_images
+
+    return workbook, skipped
 _LEGACY_XLS_CACHE_VERSION = "2.6.5-excel-script-execution"
 
 
@@ -1131,6 +1211,7 @@ class WorkbookModel:
         self.workbook = None
         self.sheets: list[SheetAdapter] = []
         self.kind = "Excel"
+        self.skipped_image_errors: list[str] = []
         self._load()
 
     @staticmethod
@@ -1192,15 +1273,14 @@ class WorkbookModel:
     def _load(self) -> None:
         suffix = self.path.suffix.lower()
         if suffix in MODERN_EXCEL_EXTENSIONS:
-            from openpyxl import load_workbook
-
             keep_vba = suffix in {".xlsm", ".xltm"}
-            workbook = load_workbook(
+            workbook, skipped_images = _safe_openpyxl_load_workbook(
                 self.path,
                 data_only=not self.show_formulas,
                 read_only=False,
                 keep_vba=keep_vba,
             )
+            self.skipped_image_errors = skipped_images
             self.workbook = workbook
             self.sheets = [
                 OpenPyxlSheetAdapter(ws, self._modern_images(ws))
@@ -1213,14 +1293,13 @@ class WorkbookModel:
             preview = legacy_xls_preview_path(self.path)
             legacy_by_sheet = legacy_xls_images(self.path)
             if preview is not None:
-                from openpyxl import load_workbook
-
-                workbook = load_workbook(
+                workbook, skipped_images = _safe_openpyxl_load_workbook(
                     preview,
                     data_only=not self.show_formulas,
                     read_only=False,
                     keep_vba=False,
                 )
+                self.skipped_image_errors = skipped_images
                 self.workbook = workbook
                 self.sheets = [
                     OpenPyxlSheetAdapter(

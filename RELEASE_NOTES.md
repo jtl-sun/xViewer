@@ -1,31 +1,16 @@
-# xViewer 2.6.7 Release Notes
+# xViewer 2.7.4
 
-## Shortcut/icon refresh fix
+Excel 변환 작업이 멈춘 뒤 다음 파일도 열리지 않던 문제를 고쳤습니다. 변환은 별도 프로세스에서 실행하며 15초 제한과 취소를 적용하고, 최신 선택을 우선 처리합니다. xViewer가 소유한 전용 Excel 프로세스만 종료 대상으로 관리합니다.
 
-2.6.7 addresses the case where Windows continued to display the previous xExcel-style Desktop icon even though the packaged `xviewer.ico` had already been replaced. Windows Explorer caches shortcut icons heavily when the icon file path stays unchanged. The installer now installs each release icon under a versioned filename, removes/recreates the Desktop and Start Menu shortcuts, sends a Shell association-change notification, and asks `ie4uinit` to refresh visible icons. The running app also sets an explicit `jtl-sun.xViewer` AppUserModelID so the taskbar identity follows xViewer instead of the generic Python host.
+- `.xls` 확장자의 실제 `.xlsx` 파일을 인식하도록 수정했습니다.
+- PDF/이미지 선택 오류, 백그라운드 예외 전달, 오래된 결과 표시를 수정했습니다.
+- 일반 PDF와 Excel PDF의 Fit/1:1, Excel PDF의 보수적인 화면 여백 축소를 적용했습니다.
+- 독립 파일 필터와 읽기 전용 텍스트 뷰어를 추가했습니다.
+- 호환 보기는 원본 저장을 막으며, 이전 COM 변환을 반복하지 않습니다.
+- PDF 캐시의 불완전 파일 검사, 원본 변경 검사, 임시 파일의 원자적 교체를 추가했습니다.
+- PDFium 호출을 직렬화하고 작업 대기열과 렌더 이미지 크기를 제한했습니다.
+- 단계별 진단 로그 및 `diagnose_excel.bat`를 추가했습니다.
 
+설치: 기존 xViewer를 종료하고 `install_xViewer.bat`를 실행하세요. GitHub 게시 여부와 별개로 이 ZIP에서 설치할 수 있습니다.
 
-## Startup and file-list usability
-
-The main xViewer window now opens centered on the primary display. The default client size remains 1580×920 and the existing minimum size is unchanged.
-
-LEFT file-list double-click now behaves like Enter: double-click a folder to enter it, or double-click a file to open it with the Windows-associated application. This is intentionally separate from the integrated RIGHT viewer, which continues to update from normal single-click or keyboard selection. The row under the mouse pointer is resolved directly before opening to avoid stale Treeview selection timing.
-
-## New xViewer icon
-
-The application icon has been refreshed for the broader xViewer identity. The new icon visually represents the three supported viewer families—Excel, PDF, and images—and is supplied as `xviewer-icon.png` plus a multi-resolution Windows `xviewer.ico`. The Windows installer, Desktop shortcut, Start Menu shortcut, Open With registration, and Tk window now use the new asset.
-
-## Legacy XLS repair preserved
-
-The GPT-6 Astra-assisted 2.6.5 repair was reviewed and retained. Its important fix is transport-level: Excel helper PowerShell scripts are no longer piped through interactive `powershell.exe -Command -`, which could return success without executing a complete multiline `try/finally` block. xViewer now passes the entire script as one command argument, uses STA for Excel clipboard automation, keeps source paths in environment variables, and invalidates older legacy caches. This allows the existing Excel-rendered PDF/XLSX/picture helper paths to actually execute.
-
-## Validation
-
-- Existing core regression suite plus new startup-centering and double-click tests.
-- Python compile check.
-- Application self-check.
-- Clean release ZIP and SHA256 generation.
-
-## Install
-
-Close xViewer, extract the ZIP, and run `install_xViewer.bat`. The installer updates the application icon and shortcuts automatically.
+검증 결과와 남은 제한은 `REVIEW-2.7.4.md`에 기록했습니다. 실제 Excel 자동화는 작업 환경의 Windows 로그온 세션 제한으로 성공 여부를 확인하지 못했습니다. 호환 보기의 읽기 성공은 Excel PDF 이미지 재현 성공을 의미하지 않습니다.

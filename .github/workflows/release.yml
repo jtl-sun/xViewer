@@ -1,9 +1,9 @@
-name: Release
+name: Release xViewer
 
 on:
-  workflow_dispatch:
   push:
-    tags: ["v*"]
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -12,43 +12,64 @@ jobs:
   release:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          python-version: "3.12"
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
           cache: pip
-      - name: Install build dependencies
-        run: python -m pip install -e ".[dev]"
-      - name: Validate release version
+
+      - name: Install and test
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip install -e ".[dev]"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m compileall -q mdir tests tools
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m unittest discover -s tests -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m mdir --check
+
+      - name: Build release assets
+        shell: pwsh
+        run: |
+          python -m build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools/package_release.py
+
+      - name: Determine version
         id: version
         shell: pwsh
         run: |
-          $version = python -c "from mdir import __version__; print(__version__)"
-          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
-            throw 'Tag does not match package version'
-          }
-          "tag=v$version" >> $env:GITHUB_OUTPUT
+          $version = python -c "import mdir; print(mdir.__version__)"
           "version=$version" >> $env:GITHUB_OUTPUT
-      - name: Compile
-        run: python -m compileall -q mdir tests tools
-      - name: Regression tests
-        run: python -m unittest discover -s tests -v
-      - name: Self-check
-        run: python -m mdir --check
-      - name: Build wheel and source distribution
-        run: python -m build
-      - name: Build Windows ZIP and checksums
-        run: python tools/package_release.py
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          target_commitish: ${{ github.sha }}
-          name: xViewer ${{ steps.version.outputs.version }}
-          body_path: RELEASE_NOTES.md
-          fail_on_unmatched_files: true
-          files: |
-            dist/xViewer-*.zip
-            dist/*.whl
-            dist/*.tar.gz
-            dist/SHA256SUMS.txt
+          "tag=v$version" >> $env:GITHUB_OUTPUT
+
+      - name: Create tag and GitHub Release if missing
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release view $env:TAG --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $env:TAG already exists; leaving it unchanged."
+            exit 0
+          }
+
+          gh release create $env:TAG `
+            dist/xViewer-$env:VERSION.zip `
+            dist/xexcel_viewer-$env:VERSION-py3-none-any.whl `
+            dist/xexcel_viewer-$env:VERSION.tar.gz `
+            dist/SHA256SUMS.txt `
+            --repo $env:GITHUB_REPOSITORY `
+            --target $env:GITHUB_SHA `
+            --title "xViewer $env:VERSION" `
+            --notes-file RELEASE_NOTES.md

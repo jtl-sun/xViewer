@@ -30,7 +30,17 @@ from .links import (
 )
 
 from .theme import THEME_CHOICES, effective_theme_name, normalize_theme_mode, palette_for
+from .text_viewer import TEXT_EXTENSIONS, TextViewer
+from .ui_dispatch import install_dispatch
+from .background import LatestWorker
 from .media_viewer import IMAGE_EXTENSIONS, PDF_EXTENSIONS, MediaViewer, media_kind_for_path
+from .excel_pdf_preview import (
+    ExcelPdfResult,
+    excel_pdf_cache_hit,
+    get_excel_pdf_engine,
+    shutdown_excel_pdf_engine,
+    _diagnostic,
+)
 
 from .excel_viewer import (
     APP_TITLE,
@@ -47,6 +57,7 @@ from .excel_viewer import (
     _merge_embedded_images,
     _column_name,
     _emu_to_pixels,
+    _safe_openpyxl_load_workbook,
 )
 
 from . import __version__ as APP_VERSION
@@ -224,8 +235,7 @@ def _type_filter_accepts(
     """Return whether one LEFT-pane item passes the active type filter.
 
     Folders always remain visible for navigation.  The three ``... only``
-    controls are exclusive in the GUI, but this helper intentionally supports
-    unions as well so tests and future UI changes remain predictable.  If none
+    controls are independent and combine as a union.  If none
     of the controls is enabled, every file type is shown.
     """
     if is_dir:
@@ -263,6 +273,8 @@ def _selection_workbook_action(paths: Iterable[Path | str]) -> str:
         return "load_pdf"
     if suffix in IMAGE_EXTENSIONS:
         return "load_image"
+    if suffix in TEXT_EXTENSIONS:
+        return "load_text"
     return "clear"
 
 
@@ -352,7 +364,7 @@ class EditableOpenPyxlSheetAdapter(OpenPyxlSheetAdapter):
 
     @property
     def editable(self) -> bool:
-        return True
+        return bool(self.model.editable)
 
     def set_value(self, row: int, column: int, value: Any) -> None:
         cell = self.ws.cell(row, column)
@@ -377,15 +389,18 @@ class EditableWorkbookModel(WorkbookModel):
     Legacy .xls workbooks remain view/copy-only.
     """
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, allow_legacy_conversion: bool = True, view_only: bool = False) -> None:
+        self.allow_legacy_conversion = allow_legacy_conversion
+        self.view_only = view_only
         self.path = Path(path)
-        self.show_formulas = True
+        self.show_formulas = not view_only
         self.workbook = None
         self.sheets = []
         self.kind = "Excel"
         self.dirty = False
         self.editable = False
         self._backup_created = False
+        self.skipped_image_errors: list[str] = []
         self._load_editable()
 
     @staticmethod
@@ -448,37 +463,53 @@ class EditableWorkbookModel(WorkbookModel):
 
     def _load_editable(self) -> None:
         suffix = self.path.suffix.lower()
+        with self.path.open('rb') as stream:
+            signature = stream.read(8)
+        actual_suffix = suffix
+        if signature.startswith(b'PK\x03\x04'):
+            actual_suffix = '.xlsx' if suffix not in MODERN_EXCEL_EXTENSIONS else suffix
+        elif signature == b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1':
+            actual_suffix = '.xls'
+        if actual_suffix != suffix:
+            self.view_only = True
+            _diagnostic('extension_mismatch', source=self.path, extension=suffix, detected=actual_suffix)
+        suffix = actual_suffix
         if suffix in MODERN_EXCEL_EXTENSIONS:
-            from openpyxl import load_workbook
-
             keep_vba = suffix in {".xlsm", ".xltm"}
-            workbook = load_workbook(
+            workbook, skipped_images = _safe_openpyxl_load_workbook(
                 self.path,
-                data_only=False,
+                data_only=self.view_only,
                 read_only=False,
                 keep_vba=keep_vba,
             )
+            self.skipped_image_errors = skipped_images
             self.workbook = workbook
+            # If openpyxl had to omit malformed drawing content, keep the
+            # workbook viewable but disable editing/saving. Saving through
+            # openpyxl at that point could permanently remove the skipped
+            # picture from the user's original workbook.
+            self.editable = not self.view_only and not bool(skipped_images)
             self.sheets = [
                 EditableOpenPyxlSheetAdapter(ws, self._modern_images(ws), self)
                 for ws in workbook.worksheets
             ]
-            self.kind = "Editable Excel"
-            self.editable = True
+            self.kind = (
+                "Editable Excel" if self.editable
+                else (f"Excel Safe View ({len(skipped_images)} malformed image/drawing item(s) skipped)" if skipped_images else "Excel compatibility view (read only)")
+            )
             return
 
         if suffix == ".xls":
-            preview = legacy_xls_preview_path(self.path)
-            legacy_by_sheet = legacy_xls_images(self.path)
+            preview = legacy_xls_preview_path(self.path) if self.allow_legacy_conversion else None
+            legacy_by_sheet = legacy_xls_images(self.path) if self.allow_legacy_conversion else {}
             if preview is not None:
-                from openpyxl import load_workbook
-
-                workbook = load_workbook(
+                workbook, skipped_images = _safe_openpyxl_load_workbook(
                     preview,
                     data_only=False,
                     read_only=False,
                     keep_vba=False,
                 )
+                self.skipped_image_errors = skipped_images
                 self.workbook = workbook
                 self.sheets = [
                     OpenPyxlSheetAdapter(
@@ -502,7 +533,7 @@ class EditableWorkbookModel(WorkbookModel):
                 )
                 for i in range(workbook.nsheets)
             ]
-            self.kind = "Legacy Excel (.xls) - read only (cell fallback + direct picture export)"
+            self.kind = "Legacy Excel (.xls) - read only compatibility view (pictures may be unavailable)"
             self.editable = False
             return
 
@@ -770,7 +801,7 @@ class EditableVirtualSheet(VirtualSheet):
 
 
 class ExcelWorkspaceApp(tk.Tk):
-    """Single-window workflow: many Excel files on the left, full workbook on the right."""
+    """Single-window workflow: files on the left, fast Excel/PDF/Image preview on the right."""
 
     def __init__(self, initial_path: Optional[Path] = None) -> None:
         _set_windows_app_user_model_id()
@@ -805,6 +836,11 @@ class ExcelWorkspaceApp(tk.Tk):
         self._directory_records: list[tuple[Path, bool, int, float]] = []
         self._records_dir: Optional[Path] = None
         self._filter_job: Optional[str] = None
+        self._excel_prefetch_job: Optional[str] = None
+        self._excel_pdf_engine = get_excel_pdf_engine()
+        self._post = install_dispatch(self)
+        self._native_worker = LatestWorker('xViewer-Native-Fallback')
+        self._native_timeout_job = None
 
         # mDIR-style right-button drag selection for the LEFT file list.
         # Right-drag is a "paint selection" gesture: every row crossed becomes
@@ -820,7 +856,7 @@ class ExcelWorkspaceApp(tk.Tk):
         self.theme_mode = tk.StringVar(value=self._initial_theme_mode())
         self.filter_var = tk.StringVar(value="")
         initial_suffix = Path(initial_path).suffix.lower() if initial_path is not None and Path(initial_path).is_file() else ""
-        self.excel_only = tk.BooleanVar(value=initial_suffix not in PDF_EXTENSIONS and initial_suffix not in IMAGE_EXTENSIONS)
+        self.excel_only = tk.BooleanVar(value=initial_suffix not in PDF_EXTENSIONS | IMAGE_EXTENSIONS | TEXT_EXTENSIONS)
         self.pdf_only = tk.BooleanVar(value=initial_suffix in PDF_EXTENSIONS)
         self.images_only = tk.BooleanVar(value=initial_suffix in IMAGE_EXTENSIONS)
         self.viewer_kind = "blank"
@@ -851,6 +887,8 @@ class ExcelWorkspaceApp(tk.Tk):
                 self.after(150, lambda: self.open_media(initial_path, "pdf"))
             elif suffix in IMAGE_EXTENSIONS:
                 self.after(150, lambda: self.open_media(initial_path, "image"))
+            elif suffix in TEXT_EXTENSIONS:
+                self.after(150, lambda: self.open_text(initial_path))
 
     def _set_icon(self) -> None:
         try:
@@ -1009,6 +1047,7 @@ class ExcelWorkspaceApp(tk.Tk):
                 pass
         try:
             self.media_view.apply_palette(palette)
+            self.text_view.apply_palette(palette)
         except Exception:
             pass
         if save:
@@ -1083,7 +1122,7 @@ class ExcelWorkspaceApp(tk.Tk):
         self.main_pane = pane
 
         left = ttk.LabelFrame(pane, text="LEFT — Files", padding=(5, 4))
-        right = ttk.LabelFrame(pane, text="RIGHT — Workbook / PDF / Image Viewer", padding=(5, 4))
+        right = ttk.LabelFrame(pane, text="RIGHT — Excel / PDF / Image / Text Viewer", padding=(5, 4))
         self.left_panel = left
         self.right_panel = right
         pane.add(left, minsize=340, stretch="always")
@@ -1140,15 +1179,15 @@ class ExcelWorkspaceApp(tk.Tk):
         type_filters.pack(fill="x", pady=(0, 4))
         ttk.Label(type_filters, text="Show:").pack(side="left")
         ttk.Checkbutton(
-            type_filters, text="Excel only", variable=self.excel_only,
+            type_filters, text="Excel", variable=self.excel_only,
             command=lambda: self._type_filter_changed("excel")
         ).pack(side="left", padx=(6, 0))
         ttk.Checkbutton(
-            type_filters, text="PDF only", variable=self.pdf_only,
+            type_filters, text="PDF", variable=self.pdf_only,
             command=lambda: self._type_filter_changed("pdf")
         ).pack(side="left", padx=(8, 0))
         ttk.Checkbutton(
-            type_filters, text="Images only", variable=self.images_only,
+            type_filters, text="Images", variable=self.images_only,
             command=lambda: self._type_filter_changed("image")
         ).pack(side="left", padx=(8, 0))
         self.search_entry.bind("<Return>", self._search_enter)
@@ -1289,7 +1328,7 @@ class ExcelWorkspaceApp(tk.Tk):
             self.blank,
             text=(
                 "Select an Excel, PDF, or image file on the left.\n\n"
-                "Excel files open as full editable workbooks.\n"
+                "Excel files open as fast Excel-rendered cached PDF previews.\n"
                 "PDF files open page-by-page, and image files open in the media viewer.\n"
                 "Ctrl+Left goes to FILES; Ctrl+Right goes to the RIGHT viewer.\n"
                 "Alt+1 jumps to FILES; Alt+2 jumps to the RIGHT viewer.\n"
@@ -1327,6 +1366,9 @@ class ExcelWorkspaceApp(tk.Tk):
             ui_palette=palette,
             zoom_callback=self._media_zoom_changed,
         )
+        self.text_view = TextViewer(right, status_callback=self._set_status, ui_palette=palette_for(self.theme_mode.get()))
+        self.media_view.failure_callback = self._media_load_failed
+        self._apply_pane_nav_bindtag(self.text_view)
         self._apply_pane_nav_bindtag(self.media_view)
 
         status = ttk.Label(self, textvariable=self.status_text, anchor="w", relief="sunken", padding=(7, 4))
@@ -1507,7 +1549,7 @@ class ExcelWorkspaceApp(tk.Tk):
     def _set_panel_indicator(self, active: str) -> None:
         try:
             self.left_panel.configure(text="LEFT — Files  [ACTIVE]" if active == "left" else "LEFT — Files")
-            self.right_panel.configure(text="RIGHT — Workbook / PDF / Image Viewer  [ACTIVE]" if active == "right" else "RIGHT — Workbook / PDF / Image Viewer")
+            self.right_panel.configure(text="RIGHT — Excel / PDF / Image / Text Viewer  [ACTIVE]" if active == "right" else "RIGHT — Excel / PDF / Image / Text Viewer")
         except Exception:
             pass
 
@@ -1521,7 +1563,10 @@ class ExcelWorkspaceApp(tk.Tk):
     def _activate_right_panel(self) -> None:
         self._active_panel = "right"
         self._set_panel_indicator("right")
-        if self.viewer_kind in {"pdf", "image"}:
+        if self.viewer_kind == 'text':
+            self.text_view.text.focus_set()
+            return
+        if self.viewer_kind in {"pdf", "image", "excel_pdf"}:
             self.media_view.canvas.focus_set()
             self.status_text.set("ACTIVE: RIGHT VIEWER | Ctrl+Left = FILES | Alt+1 = FILES")
             return
@@ -1905,7 +1950,7 @@ class ExcelWorkspaceApp(tk.Tk):
         elif action in {"edit_links", "links"}:
             self._edit_quick_links()
         elif action == "toggle_preview":
-            self.status_text.set("xExcel uses the full workbook pane instead of mDIR's preview toggle.")
+            self.status_text.set("xViewer uses a cached Excel-rendered PDF preview for Excel files.")
         elif action == "toggle_ai_terminal":
             self.status_text.set("AI/File panel is not part of the Excel-focused xExcel layout.")
         elif action == "hidden_system":
@@ -2201,22 +2246,7 @@ class ExcelWorkspaceApp(tk.Tk):
         self.refresh_files(rescan=False)
 
     def _type_filter_changed(self, selected: str) -> None:
-        """Keep Excel/PDF/Image ``only`` controls mutually exclusive.
-
-        Turning the currently active control off leaves all three off, which
-        intentionally means "show all file types". Folders are always visible.
-        """
-        selected = str(selected).lower()
-        mapping = {
-            "excel": self.excel_only,
-            "pdf": self.pdf_only,
-            "image": self.images_only,
-        }
-        active = mapping.get(selected)
-        if active is not None and active.get():
-            for name, var in mapping.items():
-                if name != selected:
-                    var.set(False)
+        """Independent filters form a union; all off shows every type."""
         self.refresh_files(rescan=False)
 
     def _schedule_filter_refresh(self, *_args) -> None:
@@ -2446,20 +2476,30 @@ class ExcelWorkspaceApp(tk.Tk):
         self._last_selected_path = path
         action = _selection_workbook_action(paths)
 
-        if action in {"load", "load_pdf", "load_image"}:
+        if action in {"load", "load_pdf", "load_image", "load_text"}:
+            if not same_selection:
+                self._excel_pdf_engine.cancel()
+                self._load_generation += 1
+                self._loading_path = None
+                self.media_view.clear()
+                self.text_view.clear()
+            delay = 220
             if self._load_job:
                 try:
                     self.after_cancel(self._load_job)
                 except Exception:
                     pass
-            # Arrow-key browsing can be fast; wait briefly so only the final file opens.
-            delay = 180 if same_selection else 240
+            # Arrow-key browsing can be fast; debounce uncached Excel slightly,
+            # but cached PDF previews should feel nearly instantaneous.
             if action == "load":
+                delay = 45 if excel_pdf_cache_hit(path) is not None else 220
                 self._load_job = self.after(delay, lambda p=path: self.open_workbook(p))
             elif action == "load_pdf":
                 self._load_job = self.after(delay, lambda p=path: self.open_media(p, "pdf"))
-            else:
+            elif action == "load_image":
                 self._load_job = self.after(delay, lambda p=path: self.open_media(p, "image"))
+            else:
+                self._load_job = self.after(delay, lambda p=path: self.open_text(p))
             return
 
         # A directory or unsupported file clears the old RIGHT content so a
@@ -2487,6 +2527,7 @@ class ExcelWorkspaceApp(tk.Tk):
         try:
             self.media_nav.pack_forget()
             self.media_view.pack_forget()
+            self.text_view.pack_forget()
         except Exception:
             pass
         if not self.formula_frame.winfo_ismapped():
@@ -2503,7 +2544,7 @@ class ExcelWorkspaceApp(tk.Tk):
 
     def _show_media_ui(self, kind: str) -> None:
         """Show the PDF/image viewer while hiding Excel-only controls."""
-        for widget in (self.formula_frame, self.sheet_nav_frame, self.notebook):
+        for widget in (self.formula_frame, self.sheet_nav_frame, self.notebook, self.text_view):
             try:
                 widget.pack_forget()
             except Exception:
@@ -2518,11 +2559,11 @@ class ExcelWorkspaceApp(tk.Tk):
         self.copy_btn.configure(state="normal")
         self.copy_image_btn.configure(state="normal")
         self.open_btn.configure(text="Open PDF" if kind == "pdf" else "Open Image", state="normal")
-        self.fit_1to1_btn.configure(state="normal" if kind == "image" else "disabled")
+        self.fit_1to1_btn.configure(state="normal" if kind in {"image", "pdf"} else "disabled")
 
     def _media_page_changed(self, page_index: int, page_count: int, kind: str) -> None:
         if kind == "pdf" and page_count > 0:
-            self.media_type_text.set("PDF")
+            self.media_type_text.set("EXCEL PDF" if self.viewer_kind == "excel_pdf" else "PDF")
             self.media_page_text.set(f"Page {page_index + 1} / {page_count}")
             self.media_first_btn.configure(state="normal" if page_index > 0 else "disabled")
             self.media_prev_btn.configure(state="normal" if page_index > 0 else "disabled")
@@ -2542,6 +2583,17 @@ class ExcelWorkspaceApp(tk.Tk):
     def _media_step_page(self, delta: int) -> None:
         self.media_view.step_page(delta)
 
+    def _media_load_failed(self, preview_path: Path, exc: Exception) -> None:
+        if self.viewer_kind != 'excel_pdf' or self.path is None:
+            return
+        # A corrupt cached/exported PDF must not permanently block this source.
+        try:
+            preview_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        self._loading_path = self.path
+        self._open_workbook_native_fallback(self.path, self._load_generation, str(exc))
+
     def _media_first_page(self) -> None:
         self.media_view.first_page()
 
@@ -2552,24 +2604,32 @@ class ExcelWorkspaceApp(tk.Tk):
         self.media_view.save_current_image_as()
 
     def _media_zoom_changed(self, zoom: float, mode: str) -> None:
-        """Keep the toolbar percentage synchronized with Image Fit/1:1."""
-        if self.viewer_kind != "image":
+        if self.viewer_kind not in {"image", "pdf", "excel_pdf"}:
             return
         pct = max(1, int(round(float(zoom) * 100)))
         self.zoom_value.set(f"{pct}%")
-        if mode == "fit":
-            self.status_text.set(
-                f"{self.path} | Image | Fit {pct}% (max 1:1)" if self.path else f"Image | Fit {pct}%"
-            )
-        elif mode == "1:1":
-            self.status_text.set(f"{self.path} | Image | 1:1 (100%)" if self.path else "Image | 1:1 (100%)")
-        elif mode == "manual":
-            self.status_text.set(f"{self.path} | Image | {pct}%" if self.path else f"Image | {pct}%")
 
     def _toggle_media_fit_one_to_one(self) -> None:
-        if self.viewer_kind != "image":
+        if self.viewer_kind not in {"image", "pdf", "excel_pdf"}:
             return
         self.media_view.toggle_fit_one_to_one()
+
+    def open_text(self, path: Path) -> None:
+        if not self._confirm_discard_or_save():
+            self._reselect_current_workbook()
+            return
+        self._clear_current_workbook_view()
+        self.viewer_kind, self.path = 'text', Path(path)
+        for widget in (self.formula_frame, self.sheet_nav_frame, self.notebook, self.media_nav, self.media_view):
+            widget.pack_forget()
+        self.text_view.pack(fill='both', expand=True)
+        self.copy_btn.configure(state='normal')
+        self.copy_image_btn.configure(state='disabled')
+        self.fit_1to1_btn.configure(state='disabled')
+        self.open_btn.configure(text='Open Text', state='normal')
+        self.workbook_title.set(f'{path.name}   [TEXT | READ ONLY]')
+        self.title(f'xViewer {APP_VERSION} — {path.name}')
+        self.text_view.load(path)
 
     def open_media(self, path: Path, kind: str) -> None:
         """Open a PDF or image inside the RIGHT viewer."""
@@ -2577,12 +2637,6 @@ class ExcelWorkspaceApp(tk.Tk):
         kind = str(kind).lower()
         if kind not in {"pdf", "image"} or not path.exists():
             return
-        if self.path is not None and self.viewer_kind == kind:
-            try:
-                if path.resolve() == self.path.resolve():
-                    return
-            except Exception:
-                pass
         if self.model is not None and not self._confirm_discard_or_save():
             self._reselect_current_workbook()
             return
@@ -2608,6 +2662,12 @@ class ExcelWorkspaceApp(tk.Tk):
         """
         self._load_generation += 1
         self._loading_path = None
+        self._excel_pdf_engine.cancel()
+        self._native_worker.cancel()
+        if self._native_timeout_job is not None:
+            self.after_cancel(self._native_timeout_job)
+            self._native_timeout_job = None
+        self.text_view.clear()
         if self._load_job:
             try:
                 self.after_cancel(self._load_job)
@@ -2827,56 +2887,163 @@ class ExcelWorkspaceApp(tk.Tk):
         return True
 
     def open_workbook(self, path: Path) -> None:
+        """Open Excel as a fast, Excel-rendered cached PDF preview.
+
+        xViewer 2.7.4 deliberately delegates visual fidelity to Microsoft Excel
+        (or LibreOffice fallback) instead of re-implementing every DrawingML,
+        VML, OLE, WMF/EMF, and legacy BIFF object.  A persistent Excel COM
+        worker and disk cache keep repeated browsing fast.
+        """
         self._load_job = None
         path = Path(path)
-        if self.path is not None and path.resolve() == self.path.resolve() and self.model is not None:
+        if not path.exists():
             return
         if not self._confirm_discard_or_save():
             self._reselect_current_workbook()
             return
-        if not path.exists():
-            return
-        try:
-            self.media_view.clear()
-        except Exception:
-            pass
-        self.viewer_kind = "excel"
-        self._show_excel_ui()
+        if self._excel_prefetch_job is not None:
+            try:
+                self.after_cancel(self._excel_prefetch_job)
+            except Exception:
+                pass
+            self._excel_prefetch_job = None
+
+        self._clear_current_workbook_view()
         self._load_generation += 1
         generation = self._load_generation
         self._loading_path = path
-        self.status_text.set(f"Loading full workbook: {path.name} ...")
-        self.workbook_title.set(f"Loading {path.name} ...")
+        self.path = path
+        self.viewer_kind = "excel_pdf"
+        self.zoom_value.set("100%")
+        self._show_media_ui("pdf")
+        self.open_btn.configure(text="Open in Excel", state="normal")
+        self.workbook_title.set(f"{path.name}   [EXCEL PREVIEW]")
+        self.title(f"xViewer {APP_VERSION} — {path.name}")
+        self.media_view.zoom = 1.0
 
-        def worker() -> None:
-            # Legacy BIFF .xls files can contain drawing objects that neither
-            # xlrd nor openpyxl can expose as images.  On Windows, prefer an
-            # exact read-only PDF rendered by Microsoft Excel itself.  This
-            # preserves old pictures/metafiles/OLE drawings visually.  If Excel
-            # automation is unavailable, fall back to the normal cell/grid path.
-            if path.suffix.lower() == ".xls":
-                try:
-                    exact_pdf = legacy_xls_pdf_preview_path(path)
-                except Exception:
-                    exact_pdf = None
-                if exact_pdf is not None and exact_pdf.is_file():
-                    self.after(0, lambda p=exact_pdf: self._load_legacy_xls_visual_complete(path, generation, p))
-                    return
+        cached = excel_pdf_cache_hit(path)
+        if cached is not None:
+            self.media_view.show_message(f"Opening cached Excel preview...\n\n{path.name}")
+            self._display_excel_pdf_preview(
+                path,
+                generation,
+                ExcelPdfResult(path, cached, True, "cache", 0.0),
+            )
+            return
+
+        self.media_view.show_message(
+            f"Preparing Excel preview...\n\n{path.name}\n\n"
+            "First view may take a moment. The next view is cached."
+        )
+        self.status_text.set(
+            f"Rendering Excel preview: {path.name} | persistent Excel engine + PDF cache"
+        )
+
+        def callback(result: ExcelPdfResult) -> None:
             try:
-                model = EditableWorkbookModel(path)
-            except Exception as exc:
-                self.after(0, lambda: self._load_failed(path, generation, exc))
-                return
-            self.after(0, lambda: self._load_complete(path, generation, model))
+                self._post(lambda r=result: self._excel_pdf_render_complete(path, generation, r))
+            except Exception:
+                pass
 
-        threading.Thread(target=worker, name="xExcel-Integrated-Workbook-Loader", daemon=True).start()
+        self._excel_pdf_engine.request(path, callback, priority=0)
+        if self._active_panel == "left":
+            self.file_tree.focus_set()
+
+    def _excel_pdf_render_complete(self, path: Path, generation: int, result: ExcelPdfResult) -> None:
+        if generation != self._load_generation:
+            return
+        if self.path is None:
+            return
+        try:
+            if path.resolve() != self.path.resolve():
+                return
+        except Exception:
+            if path != self.path:
+                return
+
+        if result.ok:
+            self._display_excel_pdf_preview(path, generation, result)
+            return
+
+        # Rendering requires installed Microsoft Excel for the fastest/highest
+        # fidelity path.  If it is unavailable or automation fails, keep xViewer
+        # useful by falling back to the older Python workbook renderer.
+        self.status_text.set(
+            f"Excel PDF preview failed for {path.name}; trying native compatibility view..."
+        )
+        self.media_view.show_message(
+            f"Excel preview engine unavailable.\nTrying compatibility view...\n\n{path.name}"
+        )
+        self._open_workbook_native_fallback(path, generation, result.error or "Preview rendering failed")
+
+    def _display_excel_pdf_preview(
+        self,
+        path: Path,
+        generation: int,
+        result: ExcelPdfResult,
+    ) -> None:
+        if generation != self._load_generation or result.pdf_path is None:
+            return
+        self.path = path
+        self.viewer_kind = "excel_pdf"
+        self._loading_path = None
+        self.model = None
+        self.zoom_value.set("100%")
+        self._show_media_ui("pdf")
+        self.open_btn.configure(text="Open in Excel", state="normal")
+        source_note = "CACHE" if result.from_cache else result.backend.upper()
+        self.workbook_title.set(f"{path.name}   [EXCEL PDF | {source_note}]")
+        self.title(f"xViewer {APP_VERSION} — {path.name}")
+        self.media_view.zoom = 1.0
+        self.media_view.load(
+            result.pdf_path,
+            "pdf",
+            display_label=f"{path} | Excel-rendered PDF preview",
+            trim_whitespace=True,
+        )
+        elapsed = f"{result.elapsed:.2f}s" if result.elapsed > 0.01 else "instant"
+        self.status_text.set(
+            f"{path} | Excel PDF preview | {source_note} | {elapsed} | "
+            "Enter/double-click/Open in Excel edits the original | preview cache enabled"
+        )
+        if self._active_panel == "left":
+            self.file_tree.focus_set()
+
+    def _open_workbook_native_fallback(self, path: Path, generation: int, error_text: str) -> None:
+        self.workbook_title.set(f"Loading compatibility view: {path.name} ...")
+        def timeout():
+            if generation == self._load_generation and self._loading_path == path:
+                self._load_failed(path, generation, TimeoutError('Compatibility view exceeded 15 seconds. Open the original in Excel.'))
+                self._load_generation += 1
+        self._native_timeout_job = self.after(15000, timeout)
+        def worker():
+            try:
+                # PDF failure must not launch the old, unbounded COM converters again.
+                model = EditableWorkbookModel(path, allow_legacy_conversion=False, view_only=True)
+            except Exception as exc:
+                detail = f"{error_text}\n\nCompatibility view also failed: {exc}"
+                self._post(lambda detail=detail: self._load_failed(path, generation, RuntimeError(detail)))
+                return
+            if generation != self._load_generation:
+                model.close()
+                return
+            self._post(lambda: self._load_complete(path, generation, model))
+        self._native_worker.submit(worker)
 
     def _load_failed(self, path: Path, generation: int, exc: Exception) -> None:
         if generation != self._load_generation:
             return
-        self.status_text.set(f"Open failed: {path.name}")
-        self.workbook_title.set("No workbook selected")
-        messagebox.showerror(APP_TITLE, f"Could not open workbook:\n\n{path}\n\n{exc}", parent=self)
+        self._loading_path = None
+        if self._native_timeout_job is not None:
+            self.after_cancel(self._native_timeout_job)
+            self._native_timeout_job = None
+        self._show_media_ui('pdf')
+        self.workbook_title.set(f"{path.name}   [OPEN FAILED]")
+        self.media_view.show_message(f"Could not open:\n{path.name}\n\n{exc}\n\nUse Open in Excel or select another file.")
+        self.open_btn.configure(text='Open in Excel', state='normal')
+        self.status_text.set(f"Open failed: {path.name} | {exc}")
+        self.viewer_kind = 'failed'
+        _diagnostic('ui_open_failed', source=path, error=str(exc))
 
     def _load_legacy_xls_visual_complete(self, path: Path, generation: int, preview_pdf: Path) -> None:
         """Show an Excel-rendered exact visual preview for a legacy .xls file.
@@ -2931,6 +3098,10 @@ class ExcelWorkspaceApp(tk.Tk):
         if generation != self._load_generation:
             model.close()
             return
+        self._loading_path = None
+        if self._native_timeout_job is not None:
+            self.after_cancel(self._native_timeout_job)
+            self._native_timeout_job = None
         old = self.model
         old_views = list(self.sheet_views)
         for tab in self.notebook.tabs():
@@ -2952,7 +3123,15 @@ class ExcelWorkspaceApp(tk.Tk):
             self._apply_pane_nav_bindtag(view)
         if old is not None:
             old.close()
-        editable_text = "EDITABLE" if model.editable else "READ ONLY (.xls)"
+        skipped_count = len(getattr(model, "skipped_image_errors", []) or [])
+        if model.editable:
+            editable_text = "EDITABLE"
+        elif path.suffix.lower() == ".xls":
+            editable_text = "READ ONLY (.xls)"
+        elif skipped_count:
+            editable_text = f"SAFE VIEW - {skipped_count} malformed image/drawing item(s) skipped"
+        else:
+            editable_text = "READ ONLY"
         image_count = sum(len(s.images) for s in model.sheets)
         self.workbook_title.set(f"{path.name}   [{editable_text}]")
         self.title(f"xViewer {APP_VERSION} — {path.name}")
@@ -2962,9 +3141,13 @@ class ExcelWorkspaceApp(tk.Tk):
         self.copy_btn.configure(state="normal")
         self.copy_image_btn.configure(state="normal")
         self.open_btn.configure(text="Open in Excel", state="normal")
+        safe_note = (
+            f" | SAFE VIEW: {skipped_count} malformed image/drawing item(s) skipped; original protected from xViewer save"
+            if skipped_count else ""
+        )
         self.status_text.set(
-            f"{path} | {len(model.sheets)} sheet(s) | {image_count} embedded image(s) | "
-            "Ctrl+Left FILES | Ctrl+Right WORKBOOK | Alt+1 FILES | Alt+2 WORKBOOK | Tab disabled in FILES / moves cells in WORKBOOK | arrows move files/cells | F2 edit | Ctrl+S save"
+            f"{path} | {len(model.sheets)} sheet(s) | {image_count} embedded image(s){safe_note} | "
+            "Compatibility view: layout or pictures may differ | Open in Excel to edit | Ctrl+Left FILES / Ctrl+Right WORKBOOK"
         )
         self._rebuild_sheet_strip()
         if self.sheet_views:
@@ -3016,7 +3199,10 @@ class ExcelWorkspaceApp(tk.Tk):
         return "break"
 
     def copy_current(self) -> None:
-        if self.viewer_kind in {"pdf", "image"}:
+        if self.viewer_kind == "text":
+            self.text_view.copy_current()
+            return
+        if self.viewer_kind in {"pdf", "image", "excel_pdf"}:
             self.media_view.copy_current()
             return
         view = self.current_view()
@@ -3031,7 +3217,7 @@ class ExcelWorkspaceApp(tk.Tk):
             view.paste_selection()
 
     def copy_image_current(self) -> None:
-        if self.viewer_kind in {"pdf", "image"}:
+        if self.viewer_kind in {"pdf", "image", "excel_pdf"}:
             self.media_view.copy_current()
             return
         view = self.current_view()
@@ -3109,7 +3295,7 @@ class ExcelWorkspaceApp(tk.Tk):
     def set_zoom(self, zoom: float) -> None:
         zoom = max(0.5, min(2.0, zoom))
         self.zoom_value.set(f"{int(round(zoom * 100))}%")
-        if self.viewer_kind in {"pdf", "image"}:
+        if self.viewer_kind in {"pdf", "image", "excel_pdf"}:
             self.media_view.set_zoom(zoom)
             return
         view = self.current_view()
@@ -3117,7 +3303,7 @@ class ExcelWorkspaceApp(tk.Tk):
             view.set_zoom(zoom)
 
     def adjust_zoom(self, delta: float) -> None:
-        if self.viewer_kind in {"pdf", "image"}:
+        if self.viewer_kind in {"pdf", "image", "excel_pdf"}:
             current = self.media_view.zoom
         else:
             view = self.current_view()
@@ -3161,6 +3347,12 @@ class ExcelWorkspaceApp(tk.Tk):
             self._theme_poll_job = None
         if self.model is not None:
             self.model.close()
+        try:
+            shutdown_excel_pdf_engine()
+        except Exception:
+            pass
+        self._native_worker.close()
+        self._load_generation += 1
         self.destroy()
 
 
@@ -3182,7 +3374,16 @@ def self_check() -> int:
         pdf = "PDF viewer OK"
     except Exception:
         pdf = "PDF viewer unavailable until pypdfium2 is installed"
-    print(f"xViewer {APP_VERSION} self-check OK ({legacy}; {pdf})")
+    if os.name == "nt":
+        try:
+            import pythoncom  # type: ignore  # noqa: F401
+            import win32com.client  # type: ignore  # noqa: F401
+            excel_pdf = "Excel automation dependency available; real Office conversion not tested by --check"
+        except Exception:
+            excel_pdf = "Excel automation dependency missing; LibreOffice/native fallback will be used"
+    else:
+        excel_pdf = "Excel PDF engine is Windows-optimized"
+    print(f"xViewer {APP_VERSION} self-check OK ({legacy}; {pdf}; {excel_pdf})")
     return 0
 
 

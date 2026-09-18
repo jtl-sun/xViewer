@@ -16,7 +16,6 @@ DIST = ROOT / "dist"
 ARCHIVE_NAME = f"xViewer-{__version__}.zip"
 EXCLUDED_DIRS = {
     ".git", ".venv", "venv", "env", "build", "dist",
-    "bootstrap", "bootstrap267", "payload",
     "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
 }
 EXCLUDED_SUFFIXES = {".pyc", ".pyo", ".log", ".tmp", ".bak", ".swp"}

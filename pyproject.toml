@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "xexcel-viewer"
 dynamic = ["version"]
-description = "xViewer: Windows dual-pane viewer for Excel workbooks, PDFs, and images."
+description = "xViewer: Windows dual-pane viewer for Excel workbooks, PDFs, images, and text."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -15,6 +15,7 @@ dependencies = [
     "xlrd>=2.0",
     "Send2Trash>=1.8",
     "pypdfium2>=4.30",
+    "pywin32>=306; platform_system == 'Windows'",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
