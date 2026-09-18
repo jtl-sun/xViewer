@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xexcel-viewer"
+dynamic = ["version"]
+description = "xViewer: Windows dual-pane viewer for Excel workbooks, PDFs, and images."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+    "Pillow>=10.0",
+    "openpyxl>=3.1",
+    "xlrd>=2.0",
+    "Send2Trash>=1.8",
+    "pypdfium2>=4.30",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Topic :: Office/Business :: Financial :: Spreadsheet",
+]
+
+[project.optional-dependencies]
+dev = ["build>=1.2"]
+
+[project.scripts]
+xviewer = "mdir.workspace_app:main"
+xview = "mdir.workspace_app:main"
+xexcel = "mdir.workspace_app:main"
+xexcel-view = "mdir.workspace_app:main"
+
+[tool.setuptools.packages.find]
+include = ["mdir*"]
+
+[tool.setuptools.package-data]
+mdir = ["assets/*.ico", "assets/*.png"]
+
+[tool.setuptools.dynamic]
+version = {attr = "mdir.__version__"}
